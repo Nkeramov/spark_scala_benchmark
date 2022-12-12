@@ -1,12 +1,14 @@
 package com.spark.scala_benchmark
 
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.api.java.UDF4
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession, functions}
+import org.apache.spark.sql.expressions.{Window, WindowSpec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DataTypes
 
 import java.sql.Date
+import java.util.{ArrayList, HashMap, List}
+import java.util.function.Function
 import scala.collection.mutable
 
 
@@ -81,6 +83,26 @@ object Main extends App {
       .withColumn("longitude_2", col("longitude_2").cast(DataTypes.DoubleType))
   }
 
+  /**
+   * measureQueryExecutionTime - measures query execution time
+   *
+   * @param spark       - current spark session
+   * @param parquetPath - path to parquet files directory (input data)
+   * @param func        - query applied to a dataset
+   * @return hashmap with query execution time and number of records in the query result dataframe
+   */
+  def measureQueryExecutionTime(spark: SparkSession, parquetPath: String,
+                                func: Function[Dataset[Row], Dataset[Row]]): mutable.HashMap[String, Long] = {
+    spark.catalog.clearCache()
+    val start = System.nanoTime
+    val df = func.apply(readParquetDataset(spark, parquetPath))
+    val recordsCount = df.count
+    val finish = System.nanoTime
+    val executionTime = (finish - start) / 1e6.toLong
+    mutable.HashMap("execution_time" -> executionTime, "records_count" -> recordsCount)
+  }
+
+
   val spark = SparkSession.builder()
     .config("spark.sql.files.ignoreCorruptFiles", "true")
     .appName("SparkScalaTest")
@@ -88,125 +110,90 @@ object Main extends App {
     .config("spark.executor.memory", "2g")
     .getOrCreate()
   spark.sparkContext.setLogLevel("ERROR")
+  //preprocessParquetDataset(spark, csvPath, parquetPath)
   var TestTimes = Array.fill[Long](TEST_TYPES_COUNT)(0)
   var start = System.nanoTime
   val opensky = readParquetDataset(spark, PARQUET_PATH).persist
   var cnt = opensky.count
   var finish = System.nanoTime
-  var timeElapsed = (finish - start) / 1e6.toLong
+  var executionTime = (finish - start) / 1e6.toLong
   println("Test reading dataset")
-  println(s"Elapsed time ${timeElapsed} ms, selected ${cnt} records")
+  println(s"Elapsed time ${executionTime} ms, selected ${cnt} records")
   println("Dataset schema")
   opensky.printSchema()
   //  print(spark.conf.get("spark.submit.deployMode"))
+  spark.catalog.clearCache
+
+  val spark_queries = new mutable.ListBuffer[Function[Dataset[Row], Dataset[Row]]]
+  spark_queries += ((df: Dataset[Row]) =>
+    df.filter(functions.col("origin").isin("UUEE", "UUDD", "UUWW"))
+      .filter(functions.to_date(functions.col("firstseen"), "YYYY-MM-DD").geq(Date.valueOf("2020-06-01")))
+      .filter(functions.to_date(functions.col("firstseen"), "YYYY-MM-DD").leq(Date.valueOf("2020-08-31")))
+      .persist)
+  spark_queries += ((df: Dataset[Row]) =>
+    df.withColumn("flighttime", functions.col("lastseen").cast(DataTypes.LongType)
+      .minus(functions.col("firstseen").cast(DataTypes.LongType)))
+    .groupBy(functions.col("origin"), functions.col("destination"))
+    .agg(functions.avg("flighttime").alias("AvgFlightTime"))
+    .orderBy(functions.col("AvgFlightTime").desc).persist)
+  val ws3 = Window.orderBy(functions.monotonically_increasing_id).rowsBetween(Long.MinValue, Long.MaxValue)
+  spark_queries += ((df: Dataset[Row]) =>
+    df.withColumn("flighttime", functions.col("lastseen").cast(DataTypes.LongType)
+      .minus(functions.col("firstseen").cast(DataTypes.LongType)))
+    .groupBy(functions.col("origin"), functions.col("destination"))
+    .agg(functions.round(functions.avg("flighttime"), DOUBLE_PRECISION).alias("AvgFlightTime"))
+    .withColumn("TotalAvgFlightTime", functions.round(functions.avg("AvgFlightTime").over(ws3)
+      .cast(DataTypes.DoubleType), DOUBLE_PRECISION))
+    .filter(functions.col("AvgFlightTime").geq(functions.col("TotalAvgFlightTime")))
+    .orderBy(functions.col("AvgFlightTime").desc).persist)
+  val ws4 = Window.orderBy(functions.col("flightdate")).rowsBetween(Window.currentRow - WINDOW_SIZE_IN_DAYS, Window.currentRow)
+  spark_queries += ((df: Dataset[Row]) =>
+    df.withColumn("distance_km", functions.round(functions.lit(2 * EARTH_RADIUS)
+      .multiply(functions.asin(functions.sqrt(functions.pow(functions.sin(functions.col("latitude_2")
+        .divide(functions.lit(DEG2RAD)).minus(functions.col("latitude_1").divide(functions.lit(DEG2RAD)))
+        .divide(functions.lit(2.0))), 2.0).plus(functions.cos(functions.col("latitude_1")
+        .divide(functions.lit(DEG2RAD))).multiply(functions.cos(functions.col("latitude_2")
+        .divide(functions.lit(DEG2RAD)))).multiply(functions.pow(functions.sin(functions.col("longitude_2")
+        .divide(functions.lit(DEG2RAD)).minus(functions.col("longitude_1")
+        .divide(functions.lit(DEG2RAD))).divide(functions.lit(2.0))), 2.0)))))), 0)
+      .divide(functions.lit(1000.0))).withColumn("flightdate", functions.to_date(functions.col("firstseen")))
+      .groupBy(functions.col("flightdate"))
+      .agg(functions.max("distance_km").as("max_distance_km"))
+      .select(functions.col("flightdate"), functions.max(functions.col("max_distance_km")).over(ws4)
+        .as("max_distance_km_on_date")).orderBy(functions.col("flightdate").asc).persist)
+
+
+  val get_distance = (latitude_1: Double, longitude_1: Double, latitude_2: Double, longitude_2: Double) =>
+    2 * EARTH_RADIUS * Math.asin(Math.sqrt(Math.pow(Math.sin((Math.toRadians(latitude_2)
+      - Math.toRadians(latitude_1)) / 2.0), 2.0) + Math.cos(Math.toRadians(latitude_1))
+      * Math.cos(Math.toRadians(latitude_2)) * Math.pow(Math.sin((Math.toRadians(longitude_2)
+      - Math.toRadians(longitude_1)) / 2.0), 2.0))).round / 1000.0
+  spark.udf.register("get_distance", get_distance)
+  spark_queries += ((df: Dataset[Row]) =>
+    df.withColumn("distance_km",
+      functions.callUDF("get_distance",
+        functions.col("latitude_1"), functions.col("longitude_1"),
+        functions.col("latitude_2"), functions.col("longitude_2")))
+      .withColumn("flightdate", functions.to_date(functions.col("firstseen")))
+      .groupBy(functions.col("flightdate")).agg(functions.max("distance_km")
+      .as("max_distance_km")).select(functions.col("flightdate"),
+      functions.max(functions.col("max_distance_km")).over(ws4).as("max_distance_km_on_date"))
+      .orderBy(functions.col("flightdate").asc).persist)
   for (i <- 0 until TEST_REPEAT_COUNT) {
-    println(s"\n${i+1} attempt")
-
-    spark.catalog.clearCache
-    println("\t1-st query (reading with filtering) started...")
-    val start1 = System.nanoTime
-    val df1 = readParquetDataset(spark, PARQUET_PATH)
-      .filter(col("origin").isin("UUEE", "UUDD", "UUWW"))
-      .filter(to_date(col("firstseen"), "YYYY-MM-DD").geq(Date.valueOf("2020-06-01")))
-      .filter(to_date(col("firstseen"), "YYYY-MM-DD").leq(Date.valueOf("2020-08-31"))).persist()
-    val cnt1 = df1.count
-    val finish1 = System.nanoTime
-    val timeElapsed1 = (finish1 - start1) / 1e6.toLong
-    println(s"\tElapsed time ${timeElapsed1} ms, selected ${cnt1} records")
-    TestTimes.update(0, (TestTimes(0) + timeElapsed1))
-
-    spark.catalog.clearCache
-    println("\t2-st query (reading with aggregation) started...")
-    val start2 = System.nanoTime
-    val df2 = readParquetDataset(spark, PARQUET_PATH)
-      .withColumn("flighttime", col("lastseen")
-        .cast(DataTypes.LongType).minus(col("firstseen").cast(DataTypes.LongType)))
-      .groupBy(col("origin"), col("destination"))
-      .agg(avg("flighttime").alias("AvgFlightTime"))
-      .orderBy(col("AvgFlightTime").desc).persist()
-    val cnt2 = df2.count
-    val finish2 = System.nanoTime
-    val timeElapsed2 = (finish2 - start2) / 1e6.toLong
-    println(s"\tElapsed time ${timeElapsed2} ms, selected ${cnt2} records")
-    TestTimes.update(1, (TestTimes(1) + timeElapsed2))
-
-    spark.catalog.clearCache
-    println("\t3-st query (reading with aggregation and then filtering) started...")
-    val ws3 = Window.orderBy(monotonically_increasing_id()).rowsBetween(Long.MinValue, Long.MaxValue)
-    val start3 = System.nanoTime
-    val df3 = readParquetDataset(spark, PARQUET_PATH)
-      .withColumn("flighttime", col("lastseen").cast(DataTypes.LongType)
-        .minus(col("firstseen").cast(DataTypes.LongType)))
-      .groupBy(col("origin"), col("destination"))
-      .agg(round(avg("flighttime"), DOUBLE_PRECISION).alias("AvgFlightTime"))
-      .withColumn("TotalAvgFlightTime", round(
-        avg("AvgFlightTime").over(ws3).cast(DataTypes.DoubleType), DOUBLE_PRECISION))
-      .filter(col("AvgFlightTime").geq(col("TotalAvgFlightTime")))
-      .orderBy(col("AvgFlightTime").desc).persist()
-    val cnt3 = df3.count
-    val finish3 = System.nanoTime
-    val timeElapsed3 = (finish3 - start3) / 1e6.toLong
-    println(s"\tElapsed time ${timeElapsed3} ms, selected ${cnt3} records")
-    TestTimes.update(2, (TestTimes(2) + timeElapsed3))
-
-    spark.catalog.clearCache
-    println("\t4-st query (reading and calculating the maximum of a complex function in a sliding window) started...")
-    val ws4 = Window.orderBy(col("flightdate"))
-      .rowsBetween(Window.currentRow - WINDOW_SIZE_IN_DAYS, Window.currentRow)
-
-    val start4 = System.nanoTime
-
-
-    var df4 = readParquetDataset(spark, PARQUET_PATH)
-      .withColumn("distance_km", round(lit(2 * EARTH_RADIUS).multiply(
-        asin(sqrt(pow(sin(col("latitude_2").divide(lit(DEG2RAD)).minus(col("latitude_1")
-          .divide(lit(DEG2RAD))).divide(lit(2.0))), 2.0)
-          .plus(cos(col("latitude_1").divide(lit(DEG2RAD))).multiply(cos(col("latitude_2")
-            .divide(lit(DEG2RAD)))).multiply(pow(sin(col("longitude_2").divide(lit(DEG2RAD))
-            .minus(col("longitude_1").divide(lit(DEG2RAD))).divide(lit(2.0))), 2.0)))))), 0)
-        .divide(lit(1000.0)))
-      .withColumn("flightdate", to_date(col("firstseen")))
-      .groupBy(col("flightdate"))
-      .agg(max("distance_km").as("max_distance_km"))
-      .select(
-        col("flightdate"),
-        max(col("max_distance_km")).over(ws4).as("max_distance_km_on_date")
-      )
-      .orderBy(col("flightdate").asc).persist()
-    val cnt4 = df4.count
-    val finish4 = System.nanoTime
-    val timeElapsed4 = (finish4 - start4) / 1e6.toLong
-    println(s"\tElapsed time ${timeElapsed4} ms, selected ${cnt4} records")
-    TestTimes.update(3, (TestTimes(3) + timeElapsed4))
-
-
-    spark.catalog.clearCache
-    println("\t5-st query (reading and calculating the maximum of a complex udf in a sliding window) started...")
-    val start5 = System.nanoTime
-    val get_distance = (latitude_1: Double, longitude_1: Double, latitude_2: Double, longitude_2: Double) =>
-      Math.round(2 * EARTH_RADIUS * Math.asin(Math.sqrt(
-        Math.pow(Math.sin((Math.toRadians(latitude_2) - Math.toRadians(latitude_1)) / 2.0), 2.0)
-          + Math.cos(Math.toRadians(latitude_1)) * Math.cos(Math.toRadians(latitude_2))
-          * Math.pow(Math.sin((Math.toRadians(longitude_2) - Math.toRadians(longitude_1)) / 2.0), 2.0)))) / 1000.0
-    spark.udf.register("get_distance", get_distance)
-    var df5 = readParquetDataset(spark, PARQUET_PATH)
-      .withColumn("distance_km",
-        callUDF("get_distance", col("latitude_1"), col("longitude_1"),
-          col("latitude_2"), col("longitude_2")))
-      .withColumn("flightdate", to_date(col("firstseen")))
-      .groupBy(col("flightdate"))
-      .agg(max("distance_km").as("max_distance_km"))
-      .select(col("flightdate"), max(col("max_distance_km")).over(ws4).as("max_distance_km_on_date"))
-      .orderBy(col("flightdate").asc).persist()
-    val cnt5 = df5.count
-    val finish5 = System.nanoTime
-    val timeElapsed5 = (finish5 - start5) / 1e6.toLong
-    println(s"\tElapsed time ${timeElapsed5} ms, selected ${cnt5} records")
-    TestTimes.update(4, (TestTimes(4) + timeElapsed5))
+    println(s"${i+1} iteration")
+    for (j <- spark_queries.indices) {
+      val spark_query = spark_queries(j)
+      val res = measureQueryExecutionTime(spark, PARQUET_PATH, spark_query)
+      val recordsCount = res.getOrElse("records_count", 0L)
+      val executionTime = res.getOrElse("execution_time", 0L)
+      TestTimes.update(j, (TestTimes(j) + executionTime))
+      println(s"\t${j + 1}-st query: elapsed time ${executionTime} ms, selected ${recordsCount} records")
+    }
   }
-
+  println("SUMMARY")
   for (i <- TestTimes.indices){
-    println(s"${i+1} ${TestTimes(i) / TEST_REPEAT_COUNT}")
+    println(s"\t${i+1} ${TestTimes(i) / TEST_REPEAT_COUNT} ms")
   }
+  println("All tests completed successfully")
   spark.stop()
 }
